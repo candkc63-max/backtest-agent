@@ -1,658 +1,225 @@
-import streamlit as st
+import os
 import pandas as pd
-import numpy as np
+import streamlit as st
 
-st.set_page_config(page_title="Backtest Agent", layout="wide")
-st.title("Backtest Agent")
+from engine import prepare_daily, symbol_from_name
+from optimizer import run_research
+from strategy_schema import StrategyConfig
+
+st.set_page_config(page_title="Backtest Agent v2", layout="wide")
+st.title("Backtest Agent v2 — Autonomous Research")
 st.caption(
-    "CSV yükle → veri kalitesini doğrula → stratejiyi test et → "
-    "aynı dönem için CAGR, benchmark ve risk metriklerini gör."
+    "Günlük hisse CSV'lerini yükle → AI stratejiyi iteratif olarak geliştirir → "
+    "Train/Validation ile optimize eder → OOS'u yalnızca en sonda açar."
 )
 
-# =====================================================
-# SABİT STRATEJİ: BOĞA PENÇESİ v5
-# =====================================================
-ADX_MIN = 22.5
-RVOL_MIN = 1.3
-RSI_MIN = 40
-RSI_MAX = 70
-BREAKOUT = 15
-SWING = 10
-ATR_MULT = 1.0
-RR = 3.5
-RISK_PCT = 0.01
-KOMISYON = 0.001
-BASLANGIC = 100_000
-WARMUP = 250
-
 with st.sidebar:
-    st.header("Strateji")
-    st.write("Boğa Pençesi v5")
-    st.write(f"ADX > {ADX_MIN}")
-    st.write(f"RVOL ≥ {RVOL_MIN}")
-    st.write(f"RSI {RSI_MIN}-{RSI_MAX}")
-    st.write(f"{BREAKOUT} mum kırılım")
-    st.write(f"Stop: son {SWING} mum dibi - {ATR_MULT} ATR")
-    st.write(f"Hedef: {RR}R")
-    st.write(f"İşlem riski: %{RISK_PCT*100:.1f}")
+    st.header("Başlangıç Stratejisi")
+    breakout_days = st.number_input("Breakout günü", 10, 100, 20, 1)
+    exit_days = st.number_input("Çıkış günü", 5, 60, 10, 1)
+    use_rvol = st.checkbox("RVOL filtresi", True)
+    rvol_lookback = st.number_input("RVOL ortalama günü", 10, 60, 20, 1)
+    rvol_min = st.number_input("Minimum RVOL", 1.0, 3.0, 1.5, 0.1)
+    use_trend = st.checkbox("Trend filtresi", True)
+    trend_ma = st.number_input("Trend MA", 50, 250, 200, 10)
+    use_atr_stop = st.checkbox("ATR stop", False)
+    atr_period = st.number_input("ATR periyodu", 10, 30, 14, 1)
+    atr_mult = st.number_input("ATR çarpanı", 1.0, 5.0, 2.0, 0.25)
+
     st.divider()
-    st.caption("Not: Bu ekran tek-hisse backtestidir. Portföy CAGR'ı değildir.")
-
-c1, c2 = st.columns(2)
-with c1:
-    hisse_file = st.file_uploader("Hisse CSV (1 saatlik)", type=["csv"])
-with c2:
-    xu_file = st.file_uploader("XU100 CSV (4 saatlik)", type=["csv"])
-
-
-# =====================================================
-# VERİ YARDIMCILARI
-# =====================================================
-def parse_dates(df):
-    df = df.copy()
-    df.columns = df.columns.str.lower().str.strip()
-
-    if "time" not in df.columns:
-        raise ValueError("CSV'de 'time' sütunu bulunamadı.")
-
-    # TradingView unix time saniye varsayımı
-    if pd.api.types.is_numeric_dtype(df["time"]):
-        df["date"] = pd.to_datetime(df["time"], unit="s", errors="coerce")
-    else:
-        df["date"] = pd.to_datetime(df["time"], errors="coerce")
-
-    df = (
-        df.dropna(subset=["date"])
-        .sort_values("date")
-        .drop_duplicates("date")
-        .reset_index(drop=True)
+    st.header("Araştırma")
+    max_rounds = st.slider("Maksimum AI turu", 2, 30, 10)
+    model = st.selectbox(
+        "AI modeli",
+        ["gpt-5.6-sol", "gpt-5.6-terra", "gpt-5.6-luna"],
+        index=1,
     )
-    return df
+    st.caption("Terra varsayılan: kalite/maliyet dengesi. Sol daha güçlü, Luna daha ucuz.")
 
+st.subheader("1) Günlük hisse verilerini yükle")
+files = st.file_uploader(
+    "Birden fazla 1D CSV yükleyebilirsin",
+    type=["csv"],
+    accept_multiple_files=True,
+)
 
-def infer_bar_minutes(df):
-    """Gece/hafta sonu boşluklarını dışlayarak tahmini mum süresini bul."""
-    if len(df) < 3:
-        return np.nan
+secret_key = ""
+try:
+    secret_key = st.secrets.get("OPENAI_API_KEY", "")
+except Exception:
+    secret_key = ""
 
-    diffs = df["date"].diff().dropna().dt.total_seconds().div(60)
-    # BIST intraday barları için 10 dakika - 8 saat aralığı
-    diffs = diffs[(diffs >= 10) & (diffs <= 480)]
-    if diffs.empty:
-        return np.nan
-    return float(diffs.median())
+api_key = secret_key or st.text_input(
+    "OpenAI API key",
+    type="password",
+    help="Anahtar sadece bu oturumdaki API çağrıları için kullanılır; uygulama tarafından kaydedilmez.",
+)
 
-
-def validate_uploads(stock_raw, xu_raw, stock_name, xu_name):
-    stock = parse_dates(stock_raw)
-    xu = parse_dates(xu_raw)
-
-    required_stock = {"open", "high", "low", "close", "volume"}
-    missing_stock = required_stock - set(stock.columns)
-    if missing_stock:
-        raise ValueError(f"Hisse CSV eksik sütunlar: {sorted(missing_stock)}")
-
-    required_xu = {"open", "high", "low", "close"}
-    missing_xu = required_xu - set(xu.columns)
-    if missing_xu:
-        raise ValueError(f"XU100 CSV eksik sütunlar: {sorted(missing_xu)}")
-
-    stock_min = infer_bar_minutes(stock)
-    xu_min = infer_bar_minutes(xu)
-
+if files:
+    valid_rows = []
+    stock_map = {}
     errors = []
 
-    # Dosya adı kontrolü: yanlış benchmark yüklenmesini engelle
-    if "XU100" not in str(xu_name).upper():
-        errors.append(
-            f"Sağdaki dosya XU100 görünmüyor: '{xu_name}'. "
-            "BIST_XU100, 240.csv yükle."
-        )
+    for f in files:
+        try:
+            raw = pd.read_csv(f)
+            prepared = prepare_daily(raw)
+            symbol = symbol_from_name(f.name)
+            if symbol in stock_map:
+                symbol = f"{symbol}_{len(stock_map)+1}"
+            stock_map[symbol] = prepared
+            valid_rows.append({
+                "Hisse": symbol,
+                "Satır": len(prepared),
+                "Başlangıç": prepared.iloc[0]["date"].date(),
+                "Bitiş": prepared.iloc[-1]["date"].date(),
+            })
+        except Exception as e:
+            errors.append({"Dosya": f.name, "Hata": str(e)})
 
-    if "XU100" in str(stock_name).upper():
-        errors.append("Soldaki dosya hisse olmalı; XU100 yüklenmiş görünüyor.")
-
-    # Zaman dilimi kontrolü
-    if pd.notna(stock_min) and not (45 <= stock_min <= 90):
-        errors.append(
-            f"Hisse verisinin tahmini mum süresi {stock_min:.0f} dk. "
-            "1 saatlik veri bekleniyor."
-        )
-
-    if pd.notna(xu_min) and not (180 <= xu_min <= 300):
-        errors.append(
-            f"XU100 verisinin tahmini mum süresi {xu_min:.0f} dk. "
-            "4 saatlik / 240 dk veri bekleniyor."
-        )
+    if valid_rows:
+        st.success(f"{len(valid_rows)} hisse doğrulandı.")
+        st.dataframe(pd.DataFrame(valid_rows), use_container_width=True, hide_index=True)
 
     if errors:
-        raise ValueError("\n".join(errors))
+        st.warning("Bazı dosyalar teste alınmadı.")
+        st.dataframe(pd.DataFrame(errors), use_container_width=True, hide_index=True)
 
-    return stock, xu, stock_min, xu_min
+    if len(stock_map) < 3:
+        st.warning(
+            "Otonom optimizasyon için en az 3, tercihen 10–20 farklı hisse kullan. "
+            "Az hisse overfit riskini ciddi artırır."
+        )
 
-
-def add_indicators(df):
-    df = df.copy()
-
-    df["ema20"] = df["close"].ewm(span=20, adjust=False).mean()
-    df["ema50"] = df["close"].ewm(span=50, adjust=False).mean()
-    df["ema200"] = df["close"].ewm(span=200, adjust=False).mean()
-
-    # RSI 14
-    delta = df["close"].diff()
-    gain = delta.clip(lower=0)
-    loss = -delta.clip(upper=0)
-    avg_gain = gain.ewm(alpha=1/14, adjust=False).mean()
-    avg_loss = loss.ewm(alpha=1/14, adjust=False).mean()
-    rs = avg_gain / avg_loss.replace(0, np.nan)
-    df["rsi"] = 100 - (100 / (1 + rs))
-
-    # ATR 14
-    prev_close = df["close"].shift(1)
-    tr = pd.concat(
-        [
-            df["high"] - df["low"],
-            (df["high"] - prev_close).abs(),
-            (df["low"] - prev_close).abs(),
-        ],
-        axis=1,
-    ).max(axis=1)
-    df["atr"] = tr.ewm(alpha=1/14, adjust=False).mean()
-
-    # ADX / DI
-    up = df["high"].diff()
-    down = -df["low"].diff()
-
-    plus_dm = pd.Series(
-        np.where((up > down) & (up > 0), up, 0.0),
-        index=df.index,
-        dtype=float,
-    )
-    minus_dm = pd.Series(
-        np.where((down > up) & (down > 0), down, 0.0),
-        index=df.index,
-        dtype=float,
+    initial = StrategyConfig(
+        breakout_days=int(breakout_days),
+        exit_days=int(exit_days),
+        use_rvol=bool(use_rvol),
+        rvol_lookback=int(rvol_lookback),
+        rvol_min=float(rvol_min),
+        use_trend_filter=bool(use_trend),
+        trend_ma=int(trend_ma),
+        use_atr_stop=bool(use_atr_stop),
+        atr_period=int(atr_period),
+        atr_mult=float(atr_mult),
     )
 
-    atr_s = tr.ewm(alpha=1/14, adjust=False).mean()
-    plus_s = plus_dm.ewm(alpha=1/14, adjust=False).mean()
-    minus_s = minus_dm.ewm(alpha=1/14, adjust=False).mean()
-
-    df["plus_di"] = 100 * plus_s / atr_s.replace(0, np.nan)
-    df["minus_di"] = 100 * minus_s / atr_s.replace(0, np.nan)
-
-    dx = (
-        100
-        * (df["plus_di"] - df["minus_di"]).abs()
-        / (df["plus_di"] + df["minus_di"]).replace(0, np.nan)
-    )
-    df["adx"] = dx.ewm(alpha=1/14, adjust=False).mean()
-
-    # RVOL
-    df["vol_ma20"] = df["volume"].rolling(20).mean()
-    df["rvol"] = df["volume"] / df["vol_ma20"].replace(0, np.nan)
-
-    # Önceki 15 mum direnci
-    df["resistance"] = df["high"].shift(1).rolling(BREAKOUT).max()
-
-    return df
-
-
-def cagr(start_value, end_value, years):
-    if years <= 0 or start_value <= 0 or end_value <= 0:
-        return np.nan
-    return (end_value / start_value) ** (1 / years) - 1
-
-
-def price_cagr(df, start_date, end_date):
-    sliced = df[(df["date"] >= start_date) & (df["date"] <= end_date)]
-    if len(sliced) < 2:
-        return np.nan
-
-    years = (end_date - start_date).total_seconds() / (365.25 * 24 * 3600)
-    return cagr(
-        float(sliced.iloc[0]["close"]),
-        float(sliced.iloc[-1]["close"]),
-        years,
+    st.subheader("2) Otonom araştırmayı başlat")
+    st.info(
+        "AI yalnızca Train + Validation sonuçlarını görür. Out-of-sample verisi "
+        "araştırma bitene kadar gizlidir ve sadece en iyi aday için bir kez açılır."
     )
 
-
-# =====================================================
-# BACKTEST
-# =====================================================
-def run_backtest(stock, xu):
-    stock = add_indicators(stock.copy())
-    xu = xu.copy()
-
-    xu["ema200_xu"] = xu["close"].ewm(span=200, adjust=False).mean()
-
-    # Sadece kapanmış 4H mum bilgisi kullanılsın
-    xu["market_bull"] = (xu["close"] > xu["ema200_xu"]).shift(1)
-
-    if len(stock) <= WARMUP + 2:
-        raise ValueError("Hisse verisi backtest için çok kısa.")
-
-    valid_xu = xu.dropna(subset=["market_bull"])
-    if valid_xu.empty:
-        raise ValueError("XU100 verisi EMA200 filtresi için çok kısa.")
-
-    # =================================================
-    # ORTAK TEST PENCERESİ
-    # CAGR artık ilk/son işleme göre DEĞİL,
-    # test edilebilir ortak veri penceresine göre hesaplanır.
-    # =================================================
-    test_start = max(
-        stock.iloc[WARMUP]["date"],
-        valid_xu.iloc[0]["date"],
-    )
-    test_end = min(
-        stock.iloc[-1]["date"],
-        xu.iloc[-1]["date"],
+    start = st.button(
+        "ARAŞTIRMAYI BAŞLAT",
+        type="primary",
+        use_container_width=True,
+        disabled=(not api_key or not stock_map),
     )
 
-    if test_end <= test_start:
-        raise ValueError("Hisse ve XU100 verilerinin ortak test dönemi yok.")
+    if not api_key:
+        st.caption("Araştırmayı başlatmak için API key gerekli.")
 
-    stock = pd.merge_asof(
-        stock.sort_values("date"),
-        xu[["date", "market_bull"]].sort_values("date"),
-        on="date",
-        direction="backward",
-    )
+    if start:
+        progress = st.progress(0)
+        status = st.empty()
+        live = st.empty()
 
-    stock["market_bull"] = stock["market_bull"].fillna(False).astype(bool)
-
-    stock["signal"] = (
-        stock["market_bull"]
-        & (stock["close"] > stock["ema200"])
-        & (stock["ema20"] > stock["ema50"])
-        & (stock["adx"] > ADX_MIN)
-        & (stock["plus_di"] > stock["minus_di"])
-        & (stock["rvol"] >= RVOL_MIN)
-        & (stock["rsi"] >= RSI_MIN)
-        & (stock["rsi"] <= RSI_MAX)
-        & (stock["close"] > stock["resistance"])
-    )
-
-    capital = BASLANGIC
-    trades = []
-    equity_curve = [BASLANGIC]
-    in_position = False
-
-    test_bars = 0
-    exposed_bars = 0
-
-    for i in range(WARMUP, len(stock) - 1):
-        row = stock.iloc[i]
-        nxt = stock.iloc[i + 1]
-
-        if row["date"] < test_start:
-            continue
-
-        if row["date"] > test_end or nxt["date"] > test_end:
-            break
-
-        test_bars += 1
-
-        # -------------------------
-        # GİRİŞ
-        # -------------------------
-        if not in_position and bool(row["signal"]):
-            entry = float(nxt["open"])
-            entry_date = nxt["date"]
-
-            swing_low = float(
-                stock["low"].iloc[i-SWING+1:i+1].min()
+        def on_progress(round_no, total, row):
+            progress.progress(round_no / total)
+            status.write(f"Tur {round_no}/{total} tamamlandı")
+            v = row["validation_metrics"]
+            live.info(
+                f"Validation — Medyan CAGR %{v['median_cagr']*100:.2f} | "
+                f"Medyan Alpha {v['median_alpha']*100:+.2f} puan | "
+                f"Medyan DD %{v['median_max_dd']*100:.2f} | "
+                f"B&H geçen %{v['beat_buyhold_pct']*100:.1f}"
             )
-            stop = swing_low - float(row["atr"]) * ATR_MULT
-            risk = entry - stop
 
-            if not np.isfinite(risk) or risk <= 0:
-                continue
-
-            qty_by_risk = (capital * RISK_PCT) / risk
-            qty_by_cash = capital / entry
-            qty = min(qty_by_risk, qty_by_cash)
-
-            if qty <= 0:
-                continue
-
-            target = entry + risk * RR
-            in_position = True
-
-            # Giriş bir sonraki mum açılışında.
-            # Aynı mum içinde stop/hedef kontrolü sonraki loop'ta başlar.
-            continue
-
-        # -------------------------
-        # POZİSYON YÖNETİMİ
-        # -------------------------
-        if in_position:
-            exposed_bars += 1
-
-            exit_price = None
-            reason = None
-
-            if float(row["open"]) <= stop:
-                exit_price = float(row["open"])
-                reason = "Gap Stop"
-
-            elif float(row["low"]) <= stop:
-                exit_price = stop
-                reason = "Stop"
-
-            elif float(row["high"]) >= target:
-                exit_price = target
-                reason = f"{RR}R"
-
-            if exit_price is not None:
-                gross = (exit_price - entry) * qty
-                commission = (entry * qty + exit_price * qty) * KOMISYON
-                pnl = gross - commission
-
-                initial_risk_tl = (entry - stop) * qty
-                r_mult = (
-                    pnl / initial_risk_tl
-                    if initial_risk_tl > 0
-                    else np.nan
-                )
-
-                capital += pnl
-
-                trades.append(
-                    {
-                        "Giriş": entry_date,
-                        "Çıkış": row["date"],
-                        "Giriş Fiyat": entry,
-                        "Stop": stop,
-                        "Hedef": target,
-                        "Çıkış Fiyat": exit_price,
-                        "PnL TL": pnl,
-                        "R": r_mult,
-                        "Neden": reason,
-                    }
-                )
-
-                in_position = False
-
-        # Mark-to-market equity
-        if in_position:
-            equity_now = capital + (float(row["close"]) - entry) * qty
-        else:
-            equity_now = capital
-
-        equity_curve.append(equity_now)
-
-    # Test sonunda açık pozisyonu ortak veri penceresinin son fiyatından kapat
-    if in_position:
-        end_slice = stock[stock["date"] <= test_end]
-        last = end_slice.iloc[-1]
-        exit_price = float(last["close"])
-
-        gross = (exit_price - entry) * qty
-        commission = (entry * qty + exit_price * qty) * KOMISYON
-        pnl = gross - commission
-
-        initial_risk_tl = (entry - stop) * qty
-        r_mult = (
-            pnl / initial_risk_tl
-            if initial_risk_tl > 0
-            else np.nan
-        )
-
-        capital += pnl
-
-        trades.append(
-            {
-                "Giriş": entry_date,
-                "Çıkış": last["date"],
-                "Giriş Fiyat": entry,
-                "Stop": stop,
-                "Hedef": target,
-                "Çıkış Fiyat": exit_price,
-                "PnL TL": pnl,
-                "R": r_mult,
-                "Neden": "Veri Sonu",
-            }
-        )
-        equity_curve.append(capital)
-
-    t = pd.DataFrame(trades)
-
-    years = (
-        (test_end - test_start).total_seconds()
-        / (365.25 * 24 * 3600)
-    )
-
-    total_return = capital / BASLANGIC - 1
-    strat_cagr = cagr(BASLANGIC, capital, years)
-
-    # Aynı tam test penceresinde benchmarklar
-    bh_cagr = price_cagr(stock, test_start, test_end)
-    xu_cagr = price_cagr(xu, test_start, test_end)
-
-    if t.empty:
-        win_rate = np.nan
-        avg_r = np.nan
-        pf = np.nan
-    else:
-        gp = t.loc[t["PnL TL"] > 0, "PnL TL"].sum()
-        gl = abs(t.loc[t["PnL TL"] < 0, "PnL TL"].sum())
-        pf = gp / gl if gl > 0 else np.nan
-        win_rate = (t["PnL TL"] > 0).mean()
-        avg_r = t["R"].mean()
-
-    equity = pd.Series(equity_curve, dtype=float)
-    max_dd = (
-        (equity / equity.cummax() - 1).min()
-        if len(equity)
-        else np.nan
-    )
-
-    exposure = (
-        exposed_bars / test_bars
-        if test_bars > 0
-        else np.nan
-    )
-
-    calmar = (
-        strat_cagr / abs(max_dd)
-        if pd.notna(max_dd) and max_dd < 0
-        else np.nan
-    )
-
-    metrics = {
-        "Test başlangıcı": test_start,
-        "Test bitişi": test_end,
-        "Süre (yıl)": years,
-        "Toplam getiri": total_return,
-        "CAGR": strat_cagr,
-        "Buy & Hold CAGR": bh_cagr,
-        "XU100 CAGR": xu_cagr,
-        "Hisseye göre alpha": (
-            strat_cagr - bh_cagr
-            if pd.notna(bh_cagr)
-            else np.nan
-        ),
-        "XU100'e göre alpha": (
-            strat_cagr - xu_cagr
-            if pd.notna(xu_cagr)
-            else np.nan
-        ),
-        "Max Drawdown": max_dd,
-        "Calmar": calmar,
-        "Profit Factor": pf,
-        "Kazanma oranı": win_rate,
-        "Ortalama R": avg_r,
-        "İşlem sayısı": len(t),
-        "İşlem / yıl": len(t) / years if years > 0 else np.nan,
-        "Piyasada kalma": exposure,
-        "Final sermaye": capital,
-        "Ham sinyal": int(
-            stock[
-                (stock["date"] >= test_start)
-                & (stock["date"] <= test_end)
-            ]["signal"].sum()
-        ),
-    }
-
-    return stock, t, metrics
-
-
-# =====================================================
-# ARAYÜZ
-# =====================================================
-if hisse_file and xu_file:
-    if st.button("TEST ET", type="primary", use_container_width=True):
         try:
-            stock_raw = pd.read_csv(hisse_file)
-            xu_raw = pd.read_csv(xu_file)
-
-            stock_ready, xu_ready, stock_min, xu_min = validate_uploads(
-                stock_raw,
-                xu_raw,
-                hisse_file.name,
-                xu_file.name,
+            result = run_research(
+                stock_map=stock_map,
+                initial_strategy=initial,
+                api_key=api_key,
+                model=model,
+                max_rounds=max_rounds,
+                progress_callback=on_progress,
             )
 
-            st.success(
-                f"Veri doğrulandı — Hisse: ~{stock_min:.0f} dk | "
-                f"XU100: ~{xu_min:.0f} dk"
-            )
+            progress.progress(1.0)
+            status.success("Araştırma tamamlandı.")
 
-            _, trades, m = run_backtest(stock_ready, xu_ready)
+            st.subheader("3) Leaderboard")
+            leaderboard_rows = []
+            for h in result["history"]:
+                tr = h["train_metrics"]
+                va = h["validation_metrics"]
+                s = h["strategy"]
+                leaderboard_rows.append({
+                    "Tur": h["round"],
+                    "Skor": h["score"],
+                    "Breakout": s["breakout_days"],
+                    "Exit": s["exit_days"],
+                    "RVOL": s["rvol_min"] if s["use_rvol"] else "Kapalı",
+                    "Trend MA": s["trend_ma"] if s["use_trend_filter"] else "Kapalı",
+                    "ATR Stop": s["atr_mult"] if s["use_atr_stop"] else "Kapalı",
+                    "Train CAGR %": tr["median_cagr"] * 100,
+                    "Val CAGR %": va["median_cagr"] * 100,
+                    "Val Alpha": va["median_alpha"] * 100,
+                    "Val Max DD %": va["median_max_dd"] * 100,
+                    "Val PF": va["median_pf"],
+                    "Val B&H Geçen %": va["beat_buyhold_pct"] * 100,
+                })
 
-            st.subheader("Zorunlu Performans Özeti")
+            leaderboard = pd.DataFrame(leaderboard_rows).sort_values("Skor", ascending=False)
+            st.dataframe(leaderboard.round(2), use_container_width=True, hide_index=True)
 
-            r1 = st.columns(5)
-            r1[0].metric("CAGR", f"%{m['CAGR']*100:.2f}")
-            r1[1].metric(
-                "Buy & Hold CAGR",
-                f"%{m['Buy & Hold CAGR']*100:.2f}"
-                if pd.notna(m["Buy & Hold CAGR"])
-                else "N/A",
-            )
-            r1[2].metric(
-                "XU100 CAGR",
-                f"%{m['XU100 CAGR']*100:.2f}"
-                if pd.notna(m["XU100 CAGR"])
-                else "N/A",
-            )
-            r1[3].metric(
-                "Max Drawdown",
-                f"%{m['Max Drawdown']*100:.2f}"
-                if pd.notna(m["Max Drawdown"])
-                else "N/A",
-            )
-            r1[4].metric(
-                "Profit Factor",
-                f"{m['Profit Factor']:.2f}"
-                if pd.notna(m["Profit Factor"])
-                else "N/A",
-            )
+            best = result["best_strategy"]
+            st.subheader("4) En iyi aday")
+            st.json(best)
 
-            r2 = st.columns(5)
-            r2[0].metric("Toplam Getiri", f"%{m['Toplam getiri']*100:.2f}")
-            r2[1].metric(
-                "Kazanma",
-                f"%{m['Kazanma oranı']*100:.2f}"
-                if pd.notna(m["Kazanma oranı"])
-                else "N/A",
-            )
-            r2[2].metric(
-                "Ortalama R",
-                f"{m['Ortalama R']:.2f}"
-                if pd.notna(m["Ortalama R"])
-                else "N/A",
-            )
-            r2[3].metric("İşlem", f"{m['İşlem sayısı']}")
-            r2[4].metric("İşlem / yıl", f"{m['İşlem / yıl']:.2f}")
+            oos = result["oos_metrics"]
+            full = result["full_metrics"]
 
-            r3 = st.columns(5)
-            xu_alpha = m["XU100'e göre alpha"]
-            stock_alpha = m["Hisseye göre alpha"]
-            r3[0].metric(
-                "XU100 Alpha",
-                f"{xu_alpha*100:+.2f} puan"
-                if pd.notna(xu_alpha)
-                else "N/A",
-            )
-            r3[1].metric(
-                "Hisse Alpha",
-                f"{stock_alpha*100:+.2f} puan"
-                if pd.notna(stock_alpha)
-                else "N/A",
-            )
-            r3[2].metric(
-                "Calmar",
-                f"{m['Calmar']:.2f}"
-                if pd.notna(m["Calmar"])
-                else "N/A",
-            )
-            r3[3].metric(
-                "Piyasada Kalma",
-                f"%{m['Piyasada kalma']*100:.1f}"
-                if pd.notna(m["Piyasada kalma"])
-                else "N/A",
-            )
-            r3[4].metric("Ham Sinyal", f"{m['Ham sinyal']}")
-
-            st.write(
-                f"**Test penceresi:** "
-                f"{m['Test başlangıcı'].date()} → {m['Test bitişi'].date()} "
-                f"(**{m['Süre (yıl)']:.2f} yıl**)"
-            )
+            c1, c2, c3, c4, c5 = st.columns(5)
+            c1.metric("OOS Medyan CAGR", f"%{oos['median_cagr']*100:.2f}")
+            c2.metric("OOS Medyan Alpha", f"{oos['median_alpha']*100:+.2f} puan")
+            c3.metric("OOS Medyan Max DD", f"%{oos['median_max_dd']*100:.2f}")
+            c4.metric("OOS Medyan PF", f"{oos['median_pf']:.2f}")
+            c5.metric("OOS B&H Geçen", f"%{oos['beat_buyhold_pct']*100:.1f}")
 
             st.caption(
-                "CAGR artık ilk işlem ile son işlem arasından değil, "
-                "warm-up sonrası ortak veri penceresinin tamamından hesaplanıyor."
+                "OOS sonuçları optimizasyon sırasında AI'ya gösterilmedi. "
+                "Bu bölüm en önemli doğrulama katmanıdır."
             )
 
-            # Karar katmanları
-            if (
-                pd.isna(m["CAGR"])
-                or pd.isna(m["Buy & Hold CAGR"])
-                or pd.isna(m["XU100 CAGR"])
-            ):
-                st.error(
-                    "KARAR: DEĞERLENDİRİLEMEZ — CAGR veya benchmark eksik."
-                )
-            else:
-                edge_ok = (
-                    pd.notna(m["Profit Factor"])
-                    and m["Profit Factor"] >= 1.30
-                    and pd.notna(m["Ortalama R"])
-                    and m["Ortalama R"] > 0
-                )
+            st.subheader("OOS hisse bazlı sonuçlar")
+            oos_table = result["oos_table"].copy()
+            show_cols = [
+                "symbol", "years", "cagr", "buyhold_cagr", "alpha", "max_dd",
+                "calmar", "pf", "win_rate", "trades", "exposure"
+            ]
+            oos_table = oos_table[show_cols]
+            for c in ["cagr", "buyhold_cagr", "alpha", "max_dd", "win_rate", "exposure"]:
+                oos_table[c] = oos_table[c] * 100
+            st.dataframe(oos_table.round(2), use_container_width=True, hide_index=True)
 
-                alpha_ok = (
-                    m["CAGR"] > m["Buy & Hold CAGR"]
-                    and m["CAGR"] > m["XU100 CAGR"]
-                )
+            st.subheader("Tam dönem özeti")
+            st.write({
+                "Medyan CAGR %": round(full["median_cagr"] * 100, 2),
+                "Medyan B&H CAGR %": round(full["median_buyhold_cagr"] * 100, 2),
+                "Medyan Alpha": round(full["median_alpha"] * 100, 2),
+                "Medyan Max DD %": round(full["median_max_dd"] * 100, 2),
+                "Medyan PF": round(full["median_pf"], 2),
+                "Buy&Hold'u geçen %": round(full["beat_buyhold_pct"] * 100, 1),
+            })
 
-                if edge_ok and alpha_ok:
-                    st.success(
-                        "KARAR: PASS — İşlem avantajı var ve CAGR aynı dönemde "
-                        "hem hisseyi hem XU100'ü geçti."
-                    )
-                elif edge_ok and not alpha_ok:
-                    st.warning(
-                        "KARAR: EDGE VAR, SERMAYE VERİMSİZ — PF/ortalama R pozitif; "
-                        "ancak CAGR benchmarkları geçmiyor. Tek-hisse 1% risk testi "
-                        "portföy seviyesinde ayrıca sınanmalı."
-                    )
-                else:
-                    st.error(
-                        "KARAR: FAIL — İşlem avantajı da yeterince güçlü değil."
-                    )
-
-            st.subheader("İşlemler")
-            if trades.empty:
-                st.info("Bu test penceresinde işlem oluşmadı.")
-            else:
-                st.dataframe(trades, use_container_width=True)
+            st.warning(
+                "Bu sistem araştırma aracıdır. OOS iyi olsa bile gerçek para öncesi "
+                "daha geniş evren, farklı dönemler ve işlem maliyeti hassasiyet testi gerekir."
+            )
 
         except Exception as e:
-            st.error(str(e))
+            st.exception(e)
 else:
-    st.info("Başlamak için hisse 1H CSV ve XU100 4H CSV yükle.")
+    st.info("Başlamak için birden fazla günlük (1D) hisse CSV'si yükle.")
