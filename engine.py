@@ -1,4 +1,3 @@
-import math
 import os
 import pandas as pd
 import numpy as np
@@ -35,13 +34,13 @@ def prepare_daily(df: pd.DataFrame) -> pd.DataFrame:
 
     df = (
         df.dropna(subset=['date', 'open', 'high', 'low', 'close', 'volume'])
-          .sort_values('date')
-          .drop_duplicates('date')
-          .reset_index(drop=True)
+        .sort_values('date')
+        .drop_duplicates('date')
+        .reset_index(drop=True)
     )
 
-    if len(df) < 300:
-        raise ValueError('En az yaklaşık 300 günlük veri gerekli.')
+    if len(df) < 350:
+        raise ValueError('En az yaklaşık 350 günlük veri gerekli.')
 
     diff_hours = df['date'].diff().dropna().dt.total_seconds().div(3600)
     if len(diff_hours) and diff_hours.median() < 20:
@@ -50,21 +49,58 @@ def prepare_daily(df: pd.DataFrame) -> pd.DataFrame:
     return df
 
 
+def _rsi(close, period):
+    delta = close.diff()
+    gain = delta.clip(lower=0)
+    loss = -delta.clip(upper=0)
+    avg_gain = gain.ewm(alpha=1/period, adjust=False).mean()
+    avg_loss = loss.ewm(alpha=1/period, adjust=False).mean()
+    rs = avg_gain / avg_loss.replace(0, np.nan)
+    return 100 - (100 / (1 + rs))
+
+
+def _adx(df, period):
+    prev_close = df['close'].shift(1)
+    tr = pd.concat([
+        df['high'] - df['low'],
+        (df['high'] - prev_close).abs(),
+        (df['low'] - prev_close).abs(),
+    ], axis=1).max(axis=1)
+
+    up = df['high'].diff()
+    down = -df['low'].diff()
+    plus_dm = pd.Series(np.where((up > down) & (up > 0), up, 0.0), index=df.index)
+    minus_dm = pd.Series(np.where((down > up) & (down > 0), down, 0.0), index=df.index)
+
+    atr = tr.ewm(alpha=1/period, adjust=False).mean()
+    plus = plus_dm.ewm(alpha=1/period, adjust=False).mean()
+    minus = minus_dm.ewm(alpha=1/period, adjust=False).mean()
+    plus_di = 100 * plus / atr.replace(0, np.nan)
+    minus_di = 100 * minus / atr.replace(0, np.nan)
+    dx = 100 * (plus_di - minus_di).abs() / (plus_di + minus_di).replace(0, np.nan)
+    return dx.ewm(alpha=1/period, adjust=False).mean(), atr
+
+
 def add_indicators(df: pd.DataFrame, cfg: StrategyConfig) -> pd.DataFrame:
     out = df.copy()
+
+    # Giriş motorları
     out['breakout_high'] = out['high'].shift(1).rolling(cfg.breakout_days).max()
-    out['exit_low'] = out['low'].shift(1).rolling(cfg.exit_days).min()
+    out['ema_fast'] = out['close'].ewm(span=cfg.ema_fast, adjust=False).mean()
+    out['ema_slow'] = out['close'].ewm(span=cfg.ema_slow, adjust=False).mean()
+    out['momentum_ref'] = out['close'].shift(cfg.momentum_days)
+
+    # Filtreler
     out['trend_ma'] = out['close'].rolling(cfg.trend_ma).mean()
     out['vol_ma'] = out['volume'].shift(1).rolling(cfg.rvol_lookback).mean()
     out['rvol'] = out['volume'] / out['vol_ma'].replace(0, np.nan)
+    out['rsi'] = _rsi(out['close'], cfg.rsi_period)
+    out['adx'], out['atr'] = _adx(out, cfg.adx_period)
 
-    prev_close = out['close'].shift(1)
-    tr = pd.concat([
-        out['high'] - out['low'],
-        (out['high'] - prev_close).abs(),
-        (out['low'] - prev_close).abs(),
-    ], axis=1).max(axis=1)
-    out['atr'] = tr.ewm(alpha=1 / cfg.atr_period, adjust=False).mean()
+    # Çıkış motorları
+    out['exit_low'] = out['low'].shift(1).rolling(cfg.exit_days).min()
+    out['exit_ma'] = out['close'].rolling(cfg.exit_ma).mean()
+
     return out
 
 
@@ -74,10 +110,26 @@ def cagr(start_value: float, end_value: float, years: float) -> float:
     return (end_value / start_value) ** (1 / years) - 1
 
 
+def _warmup(cfg: StrategyConfig):
+    return max(
+        cfg.breakout_days,
+        cfg.ema_slow,
+        cfg.momentum_days,
+        cfg.rvol_lookback,
+        cfg.trend_ma,
+        cfg.rsi_period,
+        cfg.adx_period,
+        cfg.exit_days,
+        cfg.exit_ma,
+        cfg.atr_period,
+        250,
+    ) + 2
+
+
 def _slice_bounds(df: pd.DataFrame, split: str, warmup: int):
     usable_start = warmup
     usable_n = len(df) - usable_start
-    if usable_n < 100:
+    if usable_n < 150:
         raise ValueError('Warm-up sonrası test için yeterli veri yok.')
 
     train_end = usable_start + int(usable_n * 0.60)
@@ -94,10 +146,52 @@ def _slice_bounds(df: pd.DataFrame, split: str, warmup: int):
     raise ValueError(f'Bilinmeyen split: {split}')
 
 
+def _entry_signal(row, prev_row, cfg):
+    cl = float(row['close'])
+
+    if cfg.entry_type == 'donchian':
+        signal = pd.notna(row['breakout_high']) and cl > float(row['breakout_high'])
+
+    elif cfg.entry_type == 'ema_cross':
+        signal = (
+            pd.notna(row['ema_fast']) and pd.notna(row['ema_slow'])
+            and pd.notna(prev_row['ema_fast']) and pd.notna(prev_row['ema_slow'])
+            and float(prev_row['ema_fast']) <= float(prev_row['ema_slow'])
+            and float(row['ema_fast']) > float(row['ema_slow'])
+        )
+
+    elif cfg.entry_type == 'momentum':
+        signal = pd.notna(row['momentum_ref']) and cl > float(row['momentum_ref'])
+
+    elif cfg.entry_type == 'rsi_breakout':
+        signal = (
+            pd.notna(row['breakout_high'])
+            and cl > float(row['breakout_high'])
+            and pd.notna(row['rsi'])
+            and float(row['rsi']) >= 55
+        )
+
+    else:
+        signal = False
+
+    if cfg.use_rvol:
+        signal = signal and pd.notna(row['rvol']) and float(row['rvol']) >= cfg.rvol_min
+
+    if cfg.use_trend_filter:
+        signal = signal and pd.notna(row['trend_ma']) and cl > float(row['trend_ma'])
+
+    if cfg.use_rsi_filter:
+        signal = signal and pd.notna(row['rsi']) and cfg.rsi_min <= float(row['rsi']) <= cfg.rsi_max
+
+    if cfg.use_adx_filter:
+        signal = signal and pd.notna(row['adx']) and float(row['adx']) >= cfg.adx_min
+
+    return bool(signal)
+
+
 def backtest_one(df: pd.DataFrame, cfg: StrategyConfig, split: str = 'full') -> dict:
     data = add_indicators(df, cfg)
-    warmup = max(cfg.breakout_days, cfg.exit_days, cfg.rvol_lookback, cfg.trend_ma, cfg.atr_period) + 2
-    start_i, end_i = _slice_bounds(data, split, warmup)
+    start_i, end_i = _slice_bounds(data, split, _warmup(cfg))
 
     if end_i - start_i < 30:
         raise ValueError('Seçilen dönem çok kısa.')
@@ -108,7 +202,7 @@ def backtest_one(df: pd.DataFrame, cfg: StrategyConfig, split: str = 'full') -> 
     if years <= 0:
         raise ValueError('Test süresi hesaplanamadı.')
 
-    # Buy & hold: aynı pencere, aynı komisyon.
+    # Buy & Hold, aynı dönem ve komisyon
     bh_entry = float(data.iloc[start_i]['open'])
     bh_exit = float(data.iloc[end_i - 1]['close'])
     bh_qty = START_CAPITAL / (bh_entry * (1 + COMMISSION))
@@ -121,7 +215,10 @@ def backtest_one(df: pd.DataFrame, cfg: StrategyConfig, split: str = 'full') -> 
     pending_buy = False
     pending_sell = False
     entry_price = entry_cost = entry_date = None
-    atr_stop = None
+    initial_stop = None
+    trailing_stop = None
+    target_price = None
+
     trades = []
     equity = [START_CAPITAL]
     position_bars = 0
@@ -129,6 +226,7 @@ def backtest_one(df: pd.DataFrame, cfg: StrategyConfig, split: str = 'full') -> 
 
     for i in range(start_i, end_i):
         row = data.iloc[i]
+        prev_row = data.iloc[i - 1]
         op = float(row['open'])
         cl = float(row['close'])
         dt = row['date']
@@ -143,7 +241,8 @@ def backtest_one(df: pd.DataFrame, cfg: StrategyConfig, split: str = 'full') -> 
             cash = net
             qty = 0.0
             in_pos = False
-            entry_price = entry_cost = entry_date = atr_stop = None
+            entry_price = entry_cost = entry_date = None
+            initial_stop = trailing_stop = target_price = None
             pending_sell = False
 
         if pending_buy and not in_pos:
@@ -154,23 +253,40 @@ def backtest_one(df: pd.DataFrame, cfg: StrategyConfig, split: str = 'full') -> 
             cash = 0.0
             in_pos = True
             pending_buy = False
-            if cfg.use_atr_stop and pd.notna(row['atr']):
-                atr_stop = entry_price - float(row['atr']) * cfg.atr_mult
+
+            atr = float(row['atr']) if pd.notna(row['atr']) else np.nan
+            if cfg.use_initial_atr_stop and pd.notna(atr):
+                initial_stop = entry_price - atr * cfg.initial_atr_mult
+            if cfg.exit_type == 'atr_trailing' and pd.notna(atr):
+                trailing_stop = entry_price - atr * cfg.atr_mult
+            if cfg.exit_type == 'fixed_r' and pd.notna(atr):
+                risk_dist = atr * (cfg.initial_atr_mult if cfg.use_initial_atr_stop else cfg.atr_mult)
+                target_price = entry_price + risk_dist * cfg.target_r
 
         if not in_pos:
-            buy_signal = pd.notna(row['breakout_high']) and cl > float(row['breakout_high'])
-            if cfg.use_rvol:
-                buy_signal = buy_signal and pd.notna(row['rvol']) and float(row['rvol']) >= cfg.rvol_min
-            if cfg.use_trend_filter:
-                buy_signal = buy_signal and pd.notna(row['trend_ma']) and cl > float(row['trend_ma'])
-            if buy_signal and i + 1 < end_i:
+            if _entry_signal(row, prev_row, cfg) and i + 1 < end_i:
                 pending_buy = True
         else:
-            exit_signal = pd.notna(row['exit_low']) and cl < float(row['exit_low'])
-            if cfg.use_atr_stop and atr_stop is not None and float(row['low']) <= atr_stop:
-                # Günlük veride intraday sıralama bilinmediğinden stop kapanışta tetiklenir,
-                # gerçek çıkış sonraki açılışta yapılır. Motor look-ahead kullanmaz.
+            exit_signal = False
+
+            if cfg.exit_type == 'donchian':
+                exit_signal = pd.notna(row['exit_low']) and cl < float(row['exit_low'])
+
+            elif cfg.exit_type == 'ma':
+                exit_signal = pd.notna(row['exit_ma']) and cl < float(row['exit_ma'])
+
+            elif cfg.exit_type == 'atr_trailing':
+                if pd.notna(row['atr']):
+                    candidate = cl - float(row['atr']) * cfg.atr_mult
+                    trailing_stop = candidate if trailing_stop is None else max(trailing_stop, candidate)
+                exit_signal = trailing_stop is not None and float(row['low']) <= trailing_stop
+
+            elif cfg.exit_type == 'fixed_r':
+                exit_signal = target_price is not None and float(row['high']) >= target_price
+
+            if cfg.use_initial_atr_stop and initial_stop is not None and float(row['low']) <= initial_stop:
                 exit_signal = True
+
             if exit_signal and i + 1 < end_i:
                 pending_sell = True
 
@@ -240,6 +356,7 @@ def aggregate_results(per_stock: list[dict]) -> dict:
     out['positive_pf_pct'] = float((frame['pf'] > 1).mean())
     out['pf_15_pct'] = float((frame['pf'] >= 1.5).mean())
     out['min_trades'] = int(frame['trades'].min())
+    out['total_trades'] = int(frame['trades'].sum())
     return out
 
 
