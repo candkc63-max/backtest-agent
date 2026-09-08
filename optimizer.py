@@ -1,5 +1,3 @@
-from dataclasses import asdict
-
 from ai_strategist import propose_strategy
 from engine import evaluate_universe
 from scoring import score_metrics
@@ -24,8 +22,8 @@ def run_research(
             break
         seen.add(key)
 
-        train_metrics, train_table = evaluate_universe(stock_map, current, 'train')
-        val_metrics, val_table = evaluate_universe(stock_map, current, 'validation')
+        train_metrics, _ = evaluate_universe(stock_map, current, 'train')
+        val_metrics, _ = evaluate_universe(stock_map, current, 'validation')
 
         train_score = score_metrics(train_metrics)
         val_score = score_metrics(val_metrics)
@@ -39,7 +37,9 @@ def run_research(
             'train_score': train_score,
             'validation_score': val_score,
             'score': combined_score,
-            'reason': 'Başlangıç stratejisi' if round_no == 1 else history[-1].get('next_reason', ''),
+            'diagnosis': '',
+            'hypothesis': 'Başlangıç stratejisi' if round_no == 1 else '',
+            'reason': 'Başlangıç stratejisi' if round_no == 1 else '',
         }
         history.append(row)
 
@@ -49,7 +49,7 @@ def run_research(
         if round_no == max_rounds:
             break
 
-        next_cfg, reason, raw = propose_strategy(
+        next_cfg, meta = propose_strategy(
             current=current,
             train_metrics=train_metrics,
             validation_metrics=val_metrics,
@@ -60,6 +60,8 @@ def run_research(
                     'train_metrics': h['train_metrics'],
                     'validation_metrics': h['validation_metrics'],
                     'score': h['score'],
+                    'diagnosis': h.get('diagnosis', ''),
+                    'hypothesis': h.get('hypothesis', ''),
                 }
                 for h in history
             ],
@@ -67,11 +69,15 @@ def run_research(
             model=model,
         )
 
-        row['next_reason'] = reason
-        row['ai_raw'] = raw
+        row['diagnosis'] = meta.get('diagnosis', '')
+        row['hypothesis'] = meta.get('hypothesis', '')
+        row['reason'] = meta.get('reason', '')
+        row['ai_raw'] = meta.get('raw', {})
 
         if strategy_key(next_cfg) in seen:
+            # AI aynı fikre döndüyse araştırmayı erken bitir.
             break
+
         current = next_cfg
 
     if not history:
@@ -81,9 +87,15 @@ def run_research(
     best = ranked[0]
     best_cfg = StrategyConfig(**best['strategy'])
 
-    # OOS sadece araştırma tamamlandıktan sonra ve yalnızca en iyi aday için açılır.
+    # OOS yalnızca araştırma tamamlandıktan sonra açılır.
     oos_metrics, oos_table = evaluate_universe(stock_map, best_cfg, 'oos')
     full_metrics, full_table = evaluate_universe(stock_map, best_cfg, 'full')
+
+    # OOS örneklem kalitesi ayrı raporlanır; optimizer bunu görmez.
+    oos_sample_ok = (
+        oos_metrics.get('total_trades', 0) >= max(15, len(stock_map) * 2)
+        and oos_metrics.get('n_stocks', 0) >= 3
+    )
 
     return {
         'history': history,
@@ -91,6 +103,7 @@ def run_research(
         'best_strategy': best_cfg.to_dict(),
         'oos_metrics': oos_metrics,
         'oos_table': oos_table,
+        'oos_sample_ok': oos_sample_ok,
         'full_metrics': full_metrics,
         'full_table': full_table,
     }
