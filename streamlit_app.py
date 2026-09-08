@@ -1,7 +1,8 @@
 import pandas as pd
 import streamlit as st
 
-from engine import prepare_daily, symbol_from_name
+from data_loader import prepare_daily_flexible
+from engine import symbol_from_name
 from optimizer import run_research
 from strategy_schema import StrategyConfig
 
@@ -73,22 +74,40 @@ with st.sidebar:
 
 st.subheader("1) Günlük hisse verilerini yükle")
 files = st.file_uploader(
-    "Birden fazla 1D CSV yükleyebilirsin",
+    "Birden fazla günlük CSV yükleyebilirsin",
     type=["csv"],
     accept_multiple_files=True,
 )
 
+# API key önce kalıcı Streamlit Secret'tan okunur.
 secret_key = ""
 try:
     secret_key = st.secrets.get("OPENAI_API_KEY", "")
 except Exception:
     secret_key = ""
 
-api_key = secret_key or st.text_input(
-    "OpenAI API key",
-    type="password",
-    help="Anahtar yalnızca API çağrıları için kullanılır; buraya sohbetten göndermeyin.",
-)
+if secret_key:
+    api_key = secret_key
+    st.success("OpenAI API key kayıtlı. Bu tarayıcı oturumunda tekrar girmen gerekmiyor.")
+else:
+    if "session_api_key" not in st.session_state:
+        st.session_state.session_api_key = ""
+
+    entered_key = st.text_input(
+        "Geçici OpenAI API key",
+        value=st.session_state.session_api_key,
+        type="password",
+        help="Bu alan oturum boyunca tutulur. Kalıcı kullanım için Streamlit Secrets'a OPENAI_API_KEY ekle.",
+    )
+    st.session_state.session_api_key = entered_key
+    api_key = entered_key
+
+    with st.expander("API key'i bir kere kaydetmek istiyorum"):
+        st.write(
+            "Streamlit'te Manage app → Settings → Secrets bölümüne şu satırı bir kez ekle:"
+        )
+        st.code('OPENAI_API_KEY = "sk-..."', language="toml")
+        st.caption("Bundan sonra uygulama anahtarı otomatik kullanır ve bu kutuyu tekrar doldurman gerekmez.")
 
 stock_map = {}
 valid_rows = []
@@ -98,7 +117,7 @@ if files:
     for f in files:
         try:
             raw = pd.read_csv(f)
-            prepared = prepare_daily(raw)
+            prepared = prepare_daily_flexible(raw)
             symbol = symbol_from_name(f.name)
             if symbol in stock_map:
                 symbol = f"{symbol}_{len(stock_map)+1}"
