@@ -19,18 +19,60 @@ def symbol_from_name(name: str) -> str:
 def prepare_daily(df: pd.DataFrame) -> pd.DataFrame:
     df = df.copy()
     df.columns = df.columns.str.lower().str.strip()
+
+    # Farklı veri kaynaklarındaki yaygın sütun adlarını standartlaştır.
+    aliases = {
+        'datetime': 'time',
+        'date': 'time',
+        'timestamp': 'time',
+        'tarih': 'time',
+        'adj close': 'close',
+        'adj_close': 'close',
+        'vol': 'volume',
+        'hacim': 'volume',
+    }
+    df = df.rename(columns={k: v for k, v in aliases.items() if k in df.columns and v not in df.columns})
+
+    # Tarih sütunu farklı adla gelmişse ilk tarih-benzeri sütunu yakalamayı dene.
+    if 'time' not in df.columns:
+        for c in df.columns:
+            if any(token in c for token in ('date', 'time', 'tarih', 'timestamp')):
+                df = df.rename(columns={c: 'time'})
+                break
+
     required = {'time', 'open', 'high', 'low', 'close', 'volume'}
     missing = required - set(df.columns)
     if missing:
-        raise ValueError(f"Eksik sütunlar: {sorted(missing)}")
+        raise ValueError(
+            f"Eksik sütunlar: {sorted(missing)} | Bulunan sütunlar: {list(df.columns)}"
+        )
 
+    # Unix saniye / milisaniye / metin tarih desteği.
     if pd.api.types.is_numeric_dtype(df['time']):
-        df['date'] = pd.to_datetime(df['time'], unit='s', errors='coerce')
+        numeric_time = pd.to_numeric(df['time'], errors='coerce')
+        finite = numeric_time.dropna()
+        if len(finite):
+            med = float(finite.abs().median())
+            unit = 'ms' if med > 10_000_000_000 else 's'
+            df['date'] = pd.to_datetime(numeric_time, unit=unit, errors='coerce')
+        else:
+            df['date'] = pd.NaT
     else:
-        df['date'] = pd.to_datetime(df['time'], errors='coerce')
+        df['date'] = pd.to_datetime(df['time'], errors='coerce', dayfirst=False)
+        if df['date'].isna().mean() > 0.5:
+            df['date'] = pd.to_datetime(df['time'], errors='coerce', dayfirst=True)
 
     for c in ['open', 'high', 'low', 'close', 'volume']:
-        df[c] = pd.to_numeric(df[c], errors='coerce')
+        if df[c].dtype == object:
+            # 1.234,56 / 1234,56 / 1234.56 gibi formatlara tolerans.
+            s = df[c].astype(str).str.strip()
+            both = s.str.contains(',', regex=False) & s.str.contains('.', regex=False)
+            s.loc[both] = s.loc[both].str.replace('.', '', regex=False).str.replace(',', '.', regex=False)
+            comma_only = s.str.contains(',', regex=False) & ~s.str.contains('.', regex=False)
+            s.loc[comma_only] = s.loc[comma_only].str.replace(',', '.', regex=False)
+            df[c] = pd.to_numeric(s, errors='coerce')
+        else:
+            df[c] = pd.to_numeric(df[c], errors='coerce')
 
     df = (
         df.dropna(subset=['date', 'open', 'high', 'low', 'close', 'volume'])
@@ -40,10 +82,11 @@ def prepare_daily(df: pd.DataFrame) -> pd.DataFrame:
     )
 
     if len(df) < 350:
-        raise ValueError('En az yaklaşık 350 günlük veri gerekli.')
+        raise ValueError(f'En az yaklaşık 350 günlük veri gerekli. Kullanılabilir satır: {len(df)}')
 
     diff_hours = df['date'].diff().dropna().dt.total_seconds().div(3600)
-    if len(diff_hours) and diff_hours.median() < 20:
+    intraday = diff_hours[(diff_hours > 0) & (diff_hours < 20)]
+    if len(diff_hours) and len(intraday) > len(diff_hours) * 0.50:
         raise ValueError('Veri günlük görünmüyor. 1D CSV gerekli.')
 
     return df
